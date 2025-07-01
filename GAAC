@@ -1,0 +1,122 @@
+import numpy as np
+from sklearn.metrics import silhouette_score, f1_score
+from sklearn.metrics import pairwise_distances
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import StandardScaler
+
+def compute_covariance_matrix(X, U, m, cluster_center):
+    N, d = X.shape
+    C = np.zeros((d, d))
+    denominator = np.sum(U**m)
+    for i in range(N):
+        diff = (X[i] - cluster_center).reshape(-1, 1)
+        C += (U[i]**m) * (diff @ diff.T)
+    return C / denominator
+
+def compute_Ai(C, d):
+    determinant = np.linalg.det(C)
+    Ai = determinant ** (1/d) * np.linalg.inv(C)
+    return Ai
+
+def fgk_update(X, V, m, max_iter=100, eps=1e-4):
+    N, d = X.shape
+    c = V.shape[0]
+    U = np.zeros((N, c))
+    for it in range(max_iter):
+        distances = np.zeros((N, c))
+        Ai_list = []
+        for i in range(c):
+            C = compute_covariance_matrix(X, np.ones(N), m, V[i])
+            Ai = compute_Ai(C, d)
+            Ai_list.append(Ai)
+        for i in range(c):
+            diff = X - V[i]
+            distances[:, i] = np.sum(diff @ Ai_list[i] * diff, axis=1)
+        distances = np.fmax(distances, 1e-10)
+        inv_dist = distances ** (-1 / (m - 1))
+        U_new = inv_dist / np.sum(inv_dist, axis=1, keepdims=True)
+        V_new = np.dot((U_new ** m).T, X) / np.sum(U_new ** m, axis=0)[:, None]
+        if np.linalg.norm(V - V_new) < eps:
+            break
+        V = V_new
+        U = U_new
+    return U, V
+
+
+def disperse(V, sigma, age):
+    noise = np.random.normal(0, sigma * np.exp(-0.05 * age), V.shape)
+    return V + noise
+
+
+def anneal(U, V, T, m, sigma=0.01):
+    V_new = V + np.random.normal(0, sigma, V.shape)
+    _, V_new_updated = fgk_update(X, V_new, m)
+    J_new = objective(X, U, V_new_updated, m)
+    J_old = objective(X, U, V, m)
+    if J_new < J_old:
+        return V_new_updated
+    elif np.random.rand() < np.exp(-(J_new - J_old) / T):
+        return V_new_updated
+    else:
+        return V
+
+
+def update_fuzzifier(m_prev, delta_J, m_min=1.5, m_max=3.0, lam=10):
+    return m_min + (m_max - m_min) * np.exp(-lam * delta_J)
+
+
+def objective(X, U, V, m):
+    N, c = U.shape
+    J = 0
+    for i in range(c):
+        diff = X - V[i]
+        dist = np.sum(diff**2, axis=1)
+        J += np.sum((U[:, i] ** m) * dist)
+    return J
+
+def GAAC(X, c=3, pop_size=15, max_iter=100):
+    N, d = X.shape
+    T = 1.0
+    alpha = 0.9
+    sigma = 0.1
+    age = np.zeros(pop_size)
+    m = 2.0
+    population = [np.random.rand(c, d) for _ in range(pop_size)]
+    scores = []
+    for t in range(max_iter):
+        new_population = []
+        deltas = []
+        for i, V in enumerate(population):
+            V_prime = disperse(V, sigma, age[i])
+            U_new, V_new = fgk_update(X, V_prime, m)
+            J_new = objective(X, U_new, V_new, m)
+            deltas.append(J_new)
+            new_population.append((J_new, V_new))
+        new_population.sort()
+        population = [v for _, v in new_population[:pop_size]]
+        age = np.array([0 if i < pop_size else age[i - pop_size] + 1 for i in range(pop_size)])
+        U_best, V_best = fgk_update(X, population[0], m)
+        J_best = objective(X, U_best, V_best, m)
+        m = update_fuzzifier(m, np.mean(deltas))
+        if t % 10 == 0:
+            V_best = anneal(U_best, V_best, T, m)
+            T *= alpha
+        scores.append(J_best)
+    return U_best, V_best, scores
+
+
+# Example usage
+from sklearn.datasets import load_iris
+
+data = load_iris()
+X = StandardScaler().fit_transform(data.data)
+U_final, V_final, scores = GAAC(X, c=3)
+
+labels = np.argmax(U_final, axis=1)
+unique_labels = np.unique(labels)
+
+if len(unique_labels) < 2:
+    print("Cannot compute silhouette score: only one cluster was formed.")
+else:
+    sil = silhouette_score(X, labels)
+    print("Silhouette Score:", sil)
